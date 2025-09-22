@@ -1,0 +1,222 @@
+from __future__ import annotations
+import datetime
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+
+# -------------------- utilidades --------------------
+
+def parse_valor(txt: str) -> float:
+    t = txt.strip().replace('R$', '').replace(' ', '')
+    if ',' in t and '.' in t:
+        t = t.replace('.', '').replace(',', '.')
+    else:
+        t = t.replace(',', '.')
+    return float(t)
+
+def brl(valor: float) -> str:
+    return "R$ " + f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# -------------------- núcleo do domínio --------------------
+
+class Historico:
+    """Agrega as transações ocorridas na conta (como no diagrama)."""
+    def __init__(self) -> None:
+        self.transacoes: List[str] = []
+
+    def adicionar_transacao(self, descricao: str) -> None:
+        self.transacoes.append(descricao)
+
+    def extrato(self, saldo_atual: float) -> str:
+        hist = "\n".join(self.transacoes) if self.transacoes else "Nenhuma transação realizada."
+        return f"Saldo atual: {brl(saldo_atual)}\nHistórico de transações:\n{hist}"
+
+
+class Transacao(ABC):
+    """Interface 'Transacao' do diagrama."""
+    @abstractmethod
+    def registrar(self, conta: "Conta") -> str:
+        ...
+
+
+@dataclass
+class Conta:
+    saldo: float
+    numero: int
+    agencia: str
+    cliente: "Cliente"
+    historico: Historico = field(default_factory=Historico)
+
+    def saldo_atual(self) -> float:
+        return self.saldo
+
+    @classmethod
+    def nova_conta(cls, cliente: "Cliente", numero: int, agencia: str = "0001", saldo_inicial: float = 0.0) -> "Conta":
+        conta = cls(saldo=saldo_inicial, numero=numero, agencia=agencia, cliente=cliente)
+        cliente.adicionar_conta(conta)
+        return conta
+
+    # estes dois métodos são chamados pelas Transações
+    def sacar(self, valor: float) -> str:
+        if valor <= 0:
+            return "Valor de saque deve ser positivo."
+        if valor > self.saldo:
+            return "Saldo insuficiente."
+        self.saldo -= valor
+        agora = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        self.historico.adicionar_transacao(f"Saque de {brl(valor)} em {agora}. Saldo: {brl(self.saldo)}")
+        return f"Saque realizado com sucesso. Saldo restante: {brl(self.saldo)}."
+
+    def depositar(self, valor: float) -> str:
+        if valor <= 0:
+            return "Valor de depósito deve ser positivo."
+        self.saldo += valor
+        agora = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        self.historico.adicionar_transacao(f"Depósito de {brl(valor)} em {agora}. Saldo: {brl(self.saldo)}")
+        return f"Depósito realizado com sucesso. Saldo atual: {brl(self.saldo)}."
+
+
+@dataclass
+class ContaCorrente(Conta):
+    """Especialização do diagrama com políticas de limite/contagem diária."""
+    limite: float = 500.00            # limite por saque
+    limite_saques: int = 10           # saques por dia
+    limite_depositos: int = 10        # depósitos por dia
+    _controle_diario: dict = field(default_factory=lambda: {
+        "data": datetime.date.today(),
+        "saques": 0,
+        "depositos": 0
+    })
+
+    # housekeeping diário
+    def _resetar_contadores(self) -> None:
+        hoje = datetime.date.today()
+        if self._controle_diario["data"] != hoje:
+            self._controle_diario = {"data": hoje, "saques": 0, "depositos": 0}
+
+    # sobrescreve políticas mantendo chamada base
+    def sacar(self, valor: float) -> str:
+        self._resetar_contadores()
+        if self._controle_diario["saques"] >= self.limite_saques:
+            return f"Limite diário de {self.limite_saques} saques atingido."
+        if valor > self.limite:
+            return f"Valor do saque excede o limite permitido ({brl(self.limite)})."
+        msg = super().sacar(valor)
+        if msg.startswith("Saque realizado"):
+            self._controle_diario["saques"] += 1
+            msg += f" Saques hoje: {self._controle_diario['saques']}/{self.limite_saques}"
+        return msg
+
+    def depositar(self, valor: float) -> str:
+        self._resetar_contadores()
+        if self._controle_diario["depositos"] >= self.limite_depositos:
+            return f"Limite diário de {self.limite_depositos} depósitos atingido."
+        msg = super().depositar(valor)
+        if msg.startswith("Depósito realizado"):
+            self._controle_diario["depositos"] += 1
+            msg += f" Depósitos hoje: {self._controle_diario['depositos']}/{self.limite_depositos}"
+        return msg
+
+
+# -------------------- Transações concretas --------------------
+
+@dataclass
+class Saque(Transacao):
+    valor: float
+    def registrar(self, conta: Conta) -> str:
+        return conta.sacar(self.valor)
+
+@dataclass
+class Deposito(Transacao):
+    valor: float
+    def registrar(self, conta: Conta) -> str:
+        return conta.depositar(self.valor)
+
+
+# -------------------- Cliente e especializações --------------------
+
+class Cliente:
+    def __init__(self, endereco: str = "") -> None:
+        self.endereco: str = endereco
+        self.contas: List[Conta] = []
+
+    def realizar_transacao(self, conta: Conta, transacao: Transacao) -> str:
+        if conta not in self.contas:
+            return "Conta não pertence a este cliente."
+        return transacao.registrar(conta)
+
+    def adicionar_conta(self, conta: Conta) -> None:
+        if conta not in self.contas:
+            self.contas.append(conta)
+
+
+@dataclass
+class PessoaFisica(Cliente):
+    cpf: str = ""
+    nome: str = ""
+    data_nascimento: datetime.date = datetime.date(1900, 1, 1)
+
+    def __init__(self, cpf: str, nome: str, data_nascimento: datetime.date, endereco: str = "") -> None:
+        super().__init__(endereco=endereco)
+        self.cpf = cpf
+        self.nome = nome
+        self.data_nascimento = data_nascimento
+
+
+# -------------------- Aplicação (CLI simples) --------------------
+
+def main():
+    # setup de exemplo: um cliente PF com uma conta corrente
+    cliente = PessoaFisica(
+        cpf="123.456.789-00",
+        nome="Cliente Demo",
+        data_nascimento=datetime.date(1990, 1, 1),
+        endereco="Rua Exemplo, 123"
+    )
+    conta = ContaCorrente.nova_conta(cliente=cliente, numero=1, agencia="0001", saldo_inicial=1800.00)
+    conta.limite = 500.00  # limite por saque
+
+    while True:
+        print("\nMenu:")
+        print("1. Saque")
+        print("2. Depósito")
+        print("3. Extrato")
+        print("4. Sair")
+
+        opcao = input("Escolha uma opção: ").strip()
+
+        if opcao == "1":
+            texto = input("Digite o valor do saque: ").strip()
+            try:
+                valor = parse_valor(texto)
+            except ValueError:
+                print("Valor inválido. Tente novamente (ex.: 356,02).")
+                continue
+            msg = cliente.realizar_transacao(conta, Saque(valor))
+            print(msg)
+
+        elif opcao == "2":
+            texto = input("Digite o valor do depósito: ").strip()
+            try:
+                valor = parse_valor(texto)
+            except ValueError:
+                print("Valor inválido. Tente novamente (ex.: 356,02).")
+                continue
+            msg = cliente.realizar_transacao(conta, Deposito(valor))
+            print(msg)
+
+        elif opcao == "3":
+            print("\n" + conta.historico.extrato(conta.saldo_atual()))
+
+        elif opcao == "4":
+            print("Saindo...")
+            break
+
+        else:
+            print("Opção inválida. Tente novamente.")
+
+
+if __name__ == "__main__":
+    main()
